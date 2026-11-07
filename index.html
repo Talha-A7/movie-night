@@ -147,6 +147,35 @@ const ICE = { iceServers: [
   { urls: 'stun:global.stun.twilio.com:3478' },
 ]};
 
+// ---- Relay (TURN) server ----
+// Needed when your networks block direct connections (stuck on "Connecting…").
+// Free: sign up at https://dashboard.metered.ca → create an app → copy its name + API key here.
+const METERED_APP = '';      // e.g. 'movienight'  (the part before .metered.live)
+const METERED_API_KEY = '';
+let hasTurn = false;
+async function getIceConfig() {
+  if (METERED_APP && METERED_API_KEY) {
+    try {
+      const r = await fetch(`https://${METERED_APP}.metered.live/api/v1/turn/credentials?apiKey=${METERED_API_KEY}`);
+      const servers = await r.json();
+      if (Array.isArray(servers) && servers.length) { hasTurn = true; return { iceServers: [...ICE.iceServers, ...servers] }; }
+    } catch (e) { console.warn('TURN credentials fetch failed', e); }
+  }
+  return ICE;
+}
+const NO_RELAY_HELP = 'Your two networks block direct connections, so a relay (TURN) server is needed — see METERED_API_KEY in index.html.';
+// Watch a connection's network path and report failures
+function watchIce(pc, onFail) {
+  if (!pc) return;
+  pc.addEventListener('iceconnectionstatechange', () => {
+    console.log('ICE state:', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'failed') onFail();
+  });
+}
+function keepAlive(p) {
+  p.on('disconnected', () => { if (!p.destroyed) { console.log('Lost room server, reconnecting…'); p.reconnect(); } });
+}
+
 let peer, isHost = false, myName = 'Me', stream = null;
 const conns = new Map();   // peerId -> DataConnection
 const calls = new Map();   // peerId -> MediaConnection (host side)
@@ -301,12 +330,13 @@ function tuneSender(pc) {
 }
 
 // ---------- HOST ----------
-$('hostBtn').onclick = () => {
+$('hostBtn').onclick = async () => {
   myName = $('hostName').value.trim() || 'Host'; saveName(myName);
   isHost = true;
   const roomCode = code();
   setStatus('Creating room…');
-  peer = new Peer(PREFIX + roomCode, { config: ICE });
+  peer = new Peer(PREFIX + roomCode, { config: await getIceConfig() });
+  keepAlive(peer);
   peer.on('open', () => {
     enterRoom();
     setStatus('Room open — waiting for your partner', 'ok');
@@ -316,6 +346,8 @@ $('hostBtn').onclick = () => {
     sysMsg(`Room ${roomCode} created. Send the code to your partner!`);
   });
   peer.on('connection', conn => {
+    sysMsg('Someone is connecting…');
+    watchIce(conn.peerConnection, () => sysMsg('❌ Connection to your partner failed. ' + (hasTurn ? 'Try again in a moment.' : NO_RELAY_HELP)));
     conn.on('open', () => {
       conns.set(conn.peer, conn);
       setStatus(`Connected (${conns.size} watching)`, 'ok');
@@ -408,15 +440,28 @@ function stopShare(silent) {
 $('stopBtn').onclick = () => stopShare();
 
 // ---------- VIEWER ----------
-$('joinBtn').onclick = () => {
+$('joinBtn').onclick = async () => {
   myName = $('joinName').value.trim() || 'Guest'; saveName(myName);
   const roomCode = $('joinCode').value.trim().toUpperCase();
   if (!roomCode) { $('joinCode').focus(); return; }
-  setStatus('Connecting…');
-  peer = new Peer({ config: ICE });
+  $('joinBtn').disabled = true;
+  setStatus('Reaching the room server…');
+  peer?.destroy();
+  peer = new Peer({ config: await getIceConfig() });
+  keepAlive(peer);
+  let opened = false;
+  const fail = text => {
+    if (opened) return;
+    setStatus(text, 'err'); $('joinBtn').disabled = false;
+    peer.destroy();
+  };
+  const timer = setTimeout(() => fail('Could not connect after 25s. ' + (hasTurn ? 'Check the code, and that the host still has the room open.' : NO_RELAY_HELP)), 25000);
   peer.on('open', () => {
+    setStatus('Found the room server — connecting to your partner…');
     const conn = peer.connect(PREFIX + roomCode, { reliable: true });
+    watchIce(conn.peerConnection, () => { clearTimeout(timer); fail('Connection failed. ' + (hasTurn ? 'Try again.' : NO_RELAY_HELP)); });
     conn.on('open', () => {
+      opened = true; clearTimeout(timer); $('joinBtn').disabled = false;
       conns.set(conn.peer, conn);
       enterRoom();
       document.querySelectorAll('.viewerOnly').forEach(el => el.classList.remove('hidden'));
@@ -432,9 +477,10 @@ $('joinBtn').onclick = () => {
     call.on('stream', s => showVideo(s, false));
   });
   peer.on('error', err => {
-    if (err.type === 'peer-unavailable') setStatus('No room with that code. Check the code and try again.', 'err');
-    else setStatus('Error: ' + err.type, 'err');
     console.error(err);
+    if (opened) return setStatus('Error: ' + err.type, 'err');
+    clearTimeout(timer);
+    fail(err.type === 'peer-unavailable' ? 'No room with that code. Check the code and that the host\'s page is still open.' : 'Error: ' + err.type);
   });
 };
 </script>
